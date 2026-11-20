@@ -115,3 +115,108 @@ def test_non_numeric_saturation_is_422(client, batch_factory):
     files = [("files", (p.name, p.read_bytes(), "application/fits")) for p in paths]
     resp = client.post("/prepare", data={"saturation": "abc"}, files=files)
     assert resp.status_code == 422
+
+
+def _prepare_with_qc(client, paths, saturation=5000.0, include_qc=True):
+    files = [
+        ("files", (p.name, p.read_bytes(), "application/fits")) for p in paths
+    ]
+    return client.post(
+        "/prepare",
+        data={"saturation": str(saturation), "include_qc": "true" if include_qc else "false"},
+        files=files,
+    )
+
+
+def test_prepare_include_qc_adds_records(client, batch_factory):
+    paths, raws, saturation = batch_factory(n=4, blank=-32768)
+    resp = _prepare_with_qc(client, paths, saturation)
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["x-qc-included"] == "1"
+    with fits.open(io.BytesIO(resp.content)) as out:
+        assert [hdu.name for hdu in out][:2] == ["PRIMARY", "COUNTS"]
+        assert [hdu.name for hdu in out[2:]] == ["QF01", "QF02", "QF03", "QF04"]
+        assert out[0].header["HASQC"] is True
+    # 未勾选时不带质检记录。
+    plain = _prepare_with_qc(client, paths, saturation, include_qc=False)
+    assert plain.status_code == 200
+    assert plain.headers["x-qc-included"] == "0"
+    with fits.open(io.BytesIO(plain.content)) as out:
+        assert len(out) == 2
+
+
+def test_diagnose_returns_per_frame_stats(client, batch_factory):
+    paths, raws, saturation = batch_factory(n=5, blank=-32768)
+    prepared = _prepare_with_qc(client, paths, saturation)
+    assert prepared.status_code == 200
+    height, width = raws[0].shape
+    resp = client.post(
+        "/diagnose",
+        data={"x0": "0", "y0": "0", "x1": str(width), "y1": str(height)},
+        files={"file": ("product.fits", prepared.content, "application/fits")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["shape"] == [height, width]
+    assert body["frame_count"] == 5
+    assert body["pixel_count"] == height * width
+    assert [frame["index"] for frame in body["frames"]] == [1, 2, 3, 4, 5]
+    for frame in body["frames"]:
+        assert set(frame) == {
+            "index",
+            "source",
+            "blank",
+            "nonpositive",
+            "saturated",
+            "participating",
+        }
+
+
+def test_diagnose_rectangle_bounds_errors(client, batch_factory):
+    paths, raws, saturation = batch_factory(n=3, blank=-32768)
+    prepared = _prepare_with_qc(client, paths, saturation)
+    height, width = raws[0].shape
+    cases = [
+        {"x0": "0", "y0": "0", "x1": str(width + 1), "y1": str(height)},
+        {"x0": "0", "y0": "0", "x1": str(width), "y1": str(height + 1)},
+        {"x0": "-1", "y0": "0", "x1": "4", "y1": "4"},
+        {"x0": "4", "y0": "4", "x1": "4", "y1": "9"},
+    ]
+    for data in cases:
+        resp = client.post(
+            "/diagnose",
+            data=data,
+            files={"file": ("product.fits", prepared.content, "application/fits")},
+        )
+        assert resp.status_code == 422, data
+        assert "detail" in resp.json()
+
+
+def test_diagnose_requires_qc_product(client, batch_factory):
+    paths, _, saturation = batch_factory(n=3)
+    plain = _prepare_with_qc(client, paths, saturation, include_qc=False)
+    resp = client.post(
+        "/diagnose",
+        data={"x0": "0", "y0": "0", "x1": "4", "y1": "4"},
+        files={"file": ("product.fits", plain.content, "application/fits")},
+    )
+    assert resp.status_code == 422
+    assert "质检记录" in resp.json()["detail"]
+
+
+def test_diagnose_truncated_upload_errors(client, batch_factory):
+    paths, _, saturation = batch_factory(n=3, blank=-32768)
+    prepared = _prepare_with_qc(client, paths, saturation)
+    resp = client.post(
+        "/diagnose",
+        data={"x0": "0", "y0": "0", "x1": "4", "y1": "4"},
+        files={
+            "file": (
+                "product.fits",
+                prepared.content[: len(prepared.content) // 2],
+                "application/fits",
+            )
+        },
+    )
+    assert resp.status_code == 422
+    assert "截断" in resp.json()["detail"] or "质检记录" in resp.json()["detail"]
